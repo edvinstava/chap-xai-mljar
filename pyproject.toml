@@ -10,5 +10,5 @@ dependencies = [
     "pandas",
     "scikit-learn",
     "shap",
-    "xgboost",
+    "xgboost>=2.0,<2.1",
 ]

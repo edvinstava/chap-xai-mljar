@@ -4,11 +4,11 @@ numpy
 pandas
 scikit-learn
 shap
-xgboost
+xgboost>=2.0,<2.1
 pandas
 numpy
 chap-core
 scikit-learn
-xgboost
+xgboost>=2.0,<2.1
 shap
 matplotlib
