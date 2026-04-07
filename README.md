@@ -1,21 +1,24 @@
-# chap-xai-template
+# chap-xai-mljar
 
-A minimal, forkable template for building [CHAP](https://dhis2-chap.github.io/chap-core/)-compatible external models with **native SHAP support**.
+A [CHAP](https://dhis2-chap.github.io/chap-core/)-compatible external forecasting model built with **MLJAR AutoML** and native **SHAP explainability** outputs.
 
-Clone or fork this repository, swap out the model, and you have a fully explainable disease-forecasting model that integrates with CHAP's XAI pipeline out of the box.
+This repository trains a regression model for `disease_cases`, generates holdout metrics, and writes SHAP artifacts that CHAP can consume.
 
-## What this template gives you
+## What this project includes
 
-- A working `train.py` / `predict.py` pair that CHAP can call directly
-- Autoregressive lag features and rolling statistics as a sensible starting point
-- A `write_native_shap()` helper that auto-detects your model type and writes `shap_values.csv` with per-row SHAP contributions — no extra work required
-- `MLproject` wired up with `provides_native_shap: true`
+- A CHAP-compatible `train.py` / `predict.py` pair
+- MLJAR AutoML training with model selection across multiple algorithms and eval metrics
+- Sequential forecasting logic that supports lag and rolling features
+- Native SHAP outputs:
+  - `shap_values.csv` from `predict.py` (per-row contributions)
+  - `<model>.shap_values.csv` and `<model>.shap_summary.png` from `train.py`
+- `MLproject` configured with `provides_native_shap: true`
 
 ## Quickstart
 
 ```bash
-git clone https://github.com/YOUR_USER/chap-xai-template
-cd chap-xai-template
+git clone https://github.com/edvinstava/chap-xai-miljar.git
+cd chap-xai-mljar
 python3 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
@@ -27,42 +30,31 @@ python train.py input/trainData.csv output/model.bin
 python predict.py output/model.bin input/trainData.csv input/futureClimateData.csv output/predictions.csv
 ```
 
-## How to adapt this to your own model
+Expected training artifacts include:
 
-### 1 — Swap the model (`train.py`)
+- `output/model.bin`
+- `output/model.bin.metrics.json`
+- `output/model.bin.shap_values.csv`
+- `output/model.bin.shap_summary.png`
 
-Open `train.py` and find the `build_model()` function:
+Prediction writes:
 
-```python
-def build_model(n_rows):
-    """Return an untrained scikit-learn compatible estimator."""
-    if n_rows < 30:
-        return LinearRegression()
-    return XGBRegressor(...)
-```
+- `output/predictions.csv`
+- `shap_values.csv`
 
-Replace the body with any [shap-supported](https://shap.readthedocs.io/en/latest/) estimator:
+## Project behavior and modeling approach
 
-```python
-# Example: LightGBM
-from lightgbm import LGBMRegressor
-def build_model(n_rows):
-    return LGBMRegressor(n_estimators=300, learning_rate=0.05)
+### 1 — Model training (`train.py`)
 
-# Example: Random Forest
-from sklearn.ensemble import RandomForestRegressor
-def build_model(n_rows):
-    return RandomForestRegressor(n_estimators=200, random_state=42)
+`train.py`:
 
-# Example: Ridge regression
-from sklearn.linear_model import Ridge
-def build_model(n_rows):
-    return Ridge(alpha=1.0)
-```
+- engineers lag/rolling/climate interaction features
+- evaluates AutoML candidates with `rmse`, `mae`, and `mape`
+- picks the eval metric using a combined holdout score
+- retrains a final model on all training rows
+- stores payload (`model`, `features`, `lags`, `metrics`, `target_transform`)
 
-The rest of `train.py` and all of `predict.py` work unchanged.
-
-### 2 — Adjust features (`train.py` + `predict.py`)
+### 2 — Feature engineering (`train.py` + `predict.py`)
 
 Features are built in `engineer_features()` in `train.py` and reconstructed
 row-by-row in `_build_features_for_row()` in `predict.py`. Both functions must
@@ -72,11 +64,19 @@ The default features are:
 - Climate: `rainfall`, `mean_temperature`
 - Calendar: `month_sin`, `month_cos` (cyclic encoding)
 - Autoregressive: `disease_cases_lag_1/2/3`
-- Rolling: `cases_roll_mean_3/6`, `cases_diff_1`, `cases_growth`, `cases_per_100k`
+- Rolling and derived: `cases_roll_mean_3/6`, `cases_diff_1`, `cases_growth`, `cases_per_100k`
+- Interactions/history: `rain_temp_interaction`, `rainfall_roll_mean_3`, `temp_roll_mean_3`, `location_case_mean_prior`, `location_case_std_prior`
 
-Remove or add features as needed for your use case.
+### 3 — Prediction (`predict.py`)
 
-### 3 — SHAP (nothing to change)
+`predict.py`:
+
+- loads the saved training payload
+- performs iterative, per-location forecasting so lag features are updated with each predicted step
+- writes `sample_0` predictions to output CSV
+- writes `shap_values.csv` for native CHAP explainability integration
+
+### 4 — SHAP explainability
 
 `write_native_shap()` in `predict.py` tries explainers in this order:
 
@@ -91,21 +91,6 @@ The output `shap_values.csv` has columns:
 location, time_period, expected_value, shap__<feature>..., value__<feature>...
 ```
 CHAP reads this file automatically when `provides_native_shap: true` is set in `MLproject`.
-
-### 4 — Update metadata (`MLproject`)
-
-Edit the `meta_data` block:
-
-```yaml
-meta_data:
-  display_name: My XAI model
-  description: >
-    One-line description of what makes your model different.
-  author: Your Name
-  contact_email: your@email.com
-```
-
-Also update the `name` field at the top (used as the model ID inside CHAP).
 
 ## Data format
 
@@ -124,11 +109,21 @@ CHAP passes harmonised CSVs with these columns:
 for autoregressive features. `future_data` has the covariate columns but
 `disease_cases` is empty for the rows to forecast.
 
+## MLproject metadata
+
+Current metadata and model name are defined in `MLproject`. If publishing this as your own model package, update:
+
+- `name`
+- `meta_data.display_name`
+- `meta_data.description`
+- `meta_data.author`
+- `meta_data.contact_email`
+
 ## Running with CHAP
 
 ```bash
 CHAP_FORCE_NATIVE_SHAP=true chap evaluate \
-  --model-name /path/to/chap-xai-template \
+  --model-name /path/to/chap-xai-mljar \
   --dataset-name ISIMIP_dengue_harmonized \
   --dataset-country brazil \
   --report-filename report.pdf \
@@ -142,9 +137,9 @@ CHAP_FORCE_NATIVE_SHAP=true chap evaluate \
 git init
 git add MLproject train.py predict.py requirements.txt pyproject.toml README.md
 git add input/   # optional: small fixture CSVs for smoke-testing
-git commit -m "Initial CHAP XAI model template"
+git commit -m "Initial CHAP XAI MLJAR model"
 git branch -M main
-git remote add origin https://github.com/YOUR_USER/chap-xai-template.git
+git remote add origin https://github.com/edvinstava/chap-xai-miljar.git
 git push -u origin main
 ```
 
