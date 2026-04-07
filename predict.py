@@ -14,7 +14,6 @@ import numpy as np
 import pandas as pd
 import shap
 from supervised.automl import AutoML
-from sklearn.linear_model import LinearRegression
 
 
 # ---------------------------------------------------------------------------
@@ -101,15 +100,8 @@ def write_native_shap(model, x_df, out_df, out_paths):
             ev = np.asarray(explainer.expected_value).reshape(-1)
             expected = np.full(len(x_df), float(ev[0]))
         except Exception:
-            y_hat = np.asarray(model.predict(x_df)).reshape(-1)
-            surrogate = LinearRegression()
-            surrogate.fit(x_df, y_hat)
-            background = x_df.mean()
-            sv = (x_df - background).to_numpy() * np.asarray(surrogate.coef_).reshape(1, -1)
-            expected = np.full(
-                len(x_df),
-                float(surrogate.intercept_ + np.dot(background.values, surrogate.coef_)),
-            )
+            print("Warning: unable to compute SHAP values with Tree, Linear, or Kernel explainers.")
+            return
 
     if isinstance(sv, list):
         sv = sv[0]
