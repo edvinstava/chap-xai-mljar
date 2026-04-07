@@ -150,14 +150,14 @@ def engineer_features(df):
 
 def build_automl(results_path, total_time_limit=180, eval_metric="rmse"):
     return AutoML(
-        mode="Compete",
+        mode="Perform",
         ml_task="regression",
         eval_metric=eval_metric,
         total_time_limit=total_time_limit,
-        algorithms=["Baseline", "Linear", "Random Forest", "Extra Trees", "LightGBM", "Xgboost", "CatBoost"],
-        explain_level=2,
+        algorithms=["Linear", "Random Forest", "Extra Trees", "LightGBM", "Xgboost"],
+        explain_level=0,
         train_ensemble=True,
-        stack_models=True,
+        stack_models=False,
         validation_strategy={
             "validation_type": "split",
             "train_ratio": 0.8,
@@ -243,7 +243,7 @@ def train(csv_fn, model_fn):
         for eval_metric in ["rmse", "mae", "mape"]:
             eval_results_path = f"{model_fn}.eval_automl_{eval_metric}"
             eval_model = build_automl(
-                eval_results_path, total_time_limit=180, eval_metric=eval_metric
+                eval_results_path, total_time_limit=75, eval_metric=eval_metric
             )
             eval_model.fit(X_train, y_train_log)
 
@@ -265,28 +265,29 @@ def train(csv_fn, model_fn):
     # --- Final model (on all data) ---
     final_results_path = f"{model_fn}.automl"
     model = build_automl(
-        final_results_path, total_time_limit=900, eval_metric=selected_eval_metric
+        final_results_path, total_time_limit=300, eval_metric=selected_eval_metric
     )
     model.fit(train_df[feature_cols], y_full_log)
 
     # --- SHAP (training-time summary) ---
-    shap_plot_fn = f"{model_fn}.shap_summary.png"
-    shap_values_fn = f"{model_fn}.shap_values.csv"
-    shap_sample = train_df[feature_cols].sample(n=min(60, len(train_df)), random_state=42)
-    try:
-        explainer = shap.Explainer(model.predict, shap_sample)
-        sv_obj = explainer(shap_sample, max_evals=(2 * shap_sample.shape[1] + 1))
-        sv = sv_obj.values
-        pd.DataFrame({'feature': feature_cols, 'mean_abs_shap': np.abs(sv).mean(axis=0)}) \
-            .sort_values('mean_abs_shap', ascending=False) \
-            .to_csv(shap_values_fn, index=False)
-        plt.figure(figsize=(10, 6))
-        shap.summary_plot(sv, shap_sample, feature_names=feature_cols, show=False)
-        plt.tight_layout()
-        plt.savefig(shap_plot_fn, dpi=200)
-        plt.close()
-    except Exception:
-        pass
+    if os.getenv("TRAIN_SHAP_SUMMARY", "0") == "1":
+        shap_plot_fn = f"{model_fn}.shap_summary.png"
+        shap_values_fn = f"{model_fn}.shap_values.csv"
+        shap_sample = train_df[feature_cols].sample(n=min(30, len(train_df)), random_state=42)
+        try:
+            explainer = shap.Explainer(model.predict, shap_sample)
+            sv_obj = explainer(shap_sample, max_evals=min(31, 2 * shap_sample.shape[1] + 1))
+            sv = sv_obj.values
+            pd.DataFrame({'feature': feature_cols, 'mean_abs_shap': np.abs(sv).mean(axis=0)}) \
+                .sort_values('mean_abs_shap', ascending=False) \
+                .to_csv(shap_values_fn, index=False)
+            plt.figure(figsize=(10, 6))
+            shap.summary_plot(sv, shap_sample, feature_names=feature_cols, show=False)
+            plt.tight_layout()
+            plt.savefig(shap_plot_fn, dpi=200)
+            plt.close()
+        except Exception:
+            pass
 
     # --- Save artifacts ---
     payload = {

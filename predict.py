@@ -1,16 +1,9 @@
 """
-predict.py — CHAP external model template with native SHAP support.
+predict.py for chap-xai-mljar.
 
-How to adapt this to your own model
--------------------------------------
-1. Keep engineer_features() in sync with the version in train.py.
-2. The write_native_shap() function auto-detects the model type and picks the
-   right shap Explainer, so you typically do not need to change it.
-3. The iterative prediction loop is needed for autoregressive features (lags,
-   rolling means). If your model does not use those, you can simplify it.
-
-CHAP calls this script as:
-    python predict.py {model} {historic_data} {future_data} {out_file}
+Generates CHAP-compatible forecasts and writes native SHAP explanations to
+`shap_values.csv` with columns:
+  location, time_period, expected_value, shap__<feature>..., value__<feature>...
 """
 
 import argparse
@@ -73,6 +66,26 @@ def write_native_shap(model, x_df, out_df, out_path="shap_values.csv"):
         except Exception:
             print("Warning: could not compute SHAP values — shap_values.csv not written.")
             return
+
+    if isinstance(sv, list):
+        sv = sv[0]
+    if hasattr(sv, "values"):
+        sv = sv.values
+    sv = np.asarray(sv)
+    if sv.ndim == 3:
+        sv = sv[:, :, 0]
+    if sv.shape != (len(x_df), len(feature_cols)):
+        raise ValueError(
+            f"Unexpected SHAP shape {sv.shape}, expected {(len(x_df), len(feature_cols))}"
+        )
+
+    expected = np.asarray(expected)
+    if expected.ndim == 0:
+        expected = np.full(len(x_df), float(expected))
+    elif expected.ndim > 1:
+        expected = expected.reshape(-1)
+    if len(expected) != len(x_df):
+        expected = np.full(len(x_df), float(expected[0]))
 
     shap_df = pd.DataFrame(sv, columns=[f"shap__{c}" for c in feature_cols])
     val_df = x_df.reset_index(drop=True).rename(columns={c: f"value__{c}" for c in feature_cols})
@@ -240,6 +253,9 @@ def predict(model_fn, historic_data_fn, future_climatedata_fn, predictions_fn):
 
     future_df['time_period'] = future_df['time_period'].dt.strftime('%Y-%m')
     x_pred_df = pd.DataFrame(x_rows)[feature_cols]
+    for col in feature_cols:
+        if col not in future_df.columns:
+            future_df[col] = x_pred_df[col].values
     shap_out_df = future_df[['location', 'time_period']].copy()
     write_native_shap(model, x_pred_df, shap_out_df)
 
