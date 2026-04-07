@@ -1,4 +1,4 @@
-name: chap_xai_lag_forecast
+name: chap_xai_template
 
 uv_env: pyproject.toml
 provides_native_shap: true
@@ -13,13 +13,13 @@ supported_period_type: month
 user_options: {}
 
 meta_data:
-  display_name: XAI lag forecast
+  display_name: XAI model template
   description: >
-    Lagged climate and population features with linear or sklearn boosting,
-    log1p target, and native SHAP outputs.
-  author: Edvin
-  author_note: Native XAI testing
-  contact_email: edvin@devotta.no
+    Template for a CHAP-compatible external model with native SHAP support.
+    Clone or fork this repository and swap out the model in train.py /
+    predict.py to build your own explainable disease-forecasting model.
+  author: Your Name
+  contact_email: your@email.com
 
 adapters:
   Cases: disease_cases

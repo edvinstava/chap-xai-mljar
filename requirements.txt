@@ -4,10 +4,5 @@ numpy
 pandas
 scikit-learn
 shap
-pandas
-numpy
-chap-core
-scikit-learn
-shap
-matplotlib
 xgboost
+mljar-supervised

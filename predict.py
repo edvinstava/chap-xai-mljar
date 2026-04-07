@@ -1,80 +1,203 @@
+"""
+predict.py — CHAP external model template with native SHAP support.
+
+How to adapt this to your own model
+-------------------------------------
+1. Keep engineer_features() in sync with the version in train.py.
+2. The write_native_shap() function auto-detects the model type and picks the
+   right shap Explainer, so you typically do not need to change it.
+3. The iterative prediction loop is needed for autoregressive features (lags,
+   rolling means). If your model does not use those, you can simplify it.
+
+CHAP calls this script as:
+    python predict.py {model} {historic_data} {future_data} {out_file}
+"""
+
 import argparse
 
 import joblib
 import numpy as np
 import pandas as pd
 import shap
+from supervised.automl import AutoML
 
+
+# ---------------------------------------------------------------------------
+# NATIVE SHAP OUTPUT  ← keep as-is; works for any shap-supported model
+# ---------------------------------------------------------------------------
+
+def write_native_shap(model, x_df, out_df, out_path="shap_values.csv"):
+    """
+    Compute per-row SHAP values and write shap_values.csv.
+
+    Tries explainers in order of preference:
+      1. TreeExplainer  — fast, exact; for XGBoost / LightGBM / RandomForest
+      2. LinearExplainer — fast, exact; for linear models
+      3. KernelExplainer — slow, model-agnostic fallback (sampled background)
+
+    The output CSV has columns:
+      location, time_period, expected_value, shap__<feature>..., value__<feature>...
+    """
+    if x_df.empty:
+        return
+
+    feature_cols = list(x_df.columns)
+
+    # 1. Tree models
+    try:
+        explainer = shap.TreeExplainer(model)
+        sv = explainer.shap_values(x_df)
+        ev = explainer.expected_value
+        expected = np.full(len(x_df), float(np.array(ev).reshape(-1)[0]))
+    except Exception:
+        sv = None
+
+    # 2. Linear models
+    if sv is None:
+        try:
+            explainer = shap.LinearExplainer(model, x_df)
+            sv = explainer.shap_values(x_df)
+            ev = explainer.expected_value
+            expected = np.full(len(x_df), float(np.array(ev).reshape(-1)[0]))
+        except Exception:
+            sv = None
+
+    # 3. Generic fallback (KernelExplainer — slow for large feature sets)
+    if sv is None:
+        try:
+            background = shap.sample(x_df, min(50, len(x_df)), random_state=42)
+            explainer = shap.KernelExplainer(model.predict, background)
+            sv = explainer.shap_values(x_df)
+            ev = explainer.expected_value
+            expected = np.full(len(x_df), float(np.array(ev).reshape(-1)[0]))
+        except Exception:
+            print("Warning: could not compute SHAP values — shap_values.csv not written.")
+            return
+
+    shap_df = pd.DataFrame(sv, columns=[f"shap__{c}" for c in feature_cols])
+    val_df = x_df.reset_index(drop=True).rename(columns={c: f"value__{c}" for c in feature_cols})
+
+    result = pd.concat([
+        out_df[['location', 'time_period']].reset_index(drop=True),
+        pd.Series(expected, name='expected_value'),
+        shap_df,
+        val_df,
+    ], axis=1)
+    result.to_csv(out_path, index=False)
+
+
+# ---------------------------------------------------------------------------
+# FEATURE ENGINEERING  ← keep in sync with train.py
+# ---------------------------------------------------------------------------
+
+def _build_features_for_row(row, state, lags, defaults, feature_cols):
+    """
+    Reconstruct the same feature vector used at training time, but from
+    the rolling state maintained per-location during sequential prediction.
+    """
+    feat = {
+        'rainfall': row['rainfall'],
+        'mean_temperature': row['mean_temperature'],
+        'month_sin': np.sin(2 * np.pi * row['time_period'].month / 12.0),
+        'month_cos': np.cos(2 * np.pi * row['time_period'].month / 12.0),
+    }
+
+    cases_1 = state['disease_cases'].tail(1)
+    cases_2 = state['disease_cases'].tail(2)
+    cases_3 = state['disease_cases'].tail(3)
+    cases_6 = state['disease_cases'].tail(6)
+
+    feat['cases_roll_mean_3'] = float(cases_3.mean()) if len(cases_3) else float(defaults['disease_cases'])
+    feat['cases_roll_mean_6'] = float(cases_6.mean()) if len(cases_6) else float(defaults['disease_cases'])
+
+    if len(cases_2) >= 2:
+        last_case = float(cases_2.iloc[-1])
+        prev_case = float(cases_2.iloc[-2])
+        feat['cases_diff_1'] = last_case - prev_case
+        feat['cases_growth'] = last_case / (prev_case + 1.0)
+    elif len(cases_1) == 1:
+        last_case = float(cases_1.iloc[-1])
+        feat['cases_diff_1'] = 0.0
+        feat['cases_growth'] = last_case / (float(defaults['disease_cases']) + 1.0)
+    else:
+        feat['cases_diff_1'] = 0.0
+        feat['cases_growth'] = 0.0
+
+    pop_value = row['population'] if pd.notna(row.get('population')) else defaults['population']
+    base_cases = float(cases_1.iloc[-1]) if len(cases_1) else float(defaults['disease_cases'])
+    feat['cases_per_100k'] = base_cases / (float(pop_value) + 1.0) * 1e5
+    feat['population'] = float(pop_value)
+    feat['rain_temp_interaction'] = float(row['rainfall']) * float(row['mean_temperature'])
+    rain_3 = state['rainfall'].tail(3)
+    temp_3 = state['mean_temperature'].tail(3)
+    feat['rainfall_roll_mean_3'] = float(rain_3.mean()) if len(rain_3) else float(defaults['rainfall'])
+    feat['temp_roll_mean_3'] = float(temp_3.mean()) if len(temp_3) else float(defaults['mean_temperature'])
+    feat['location_case_mean_prior'] = float(state['disease_cases'].mean()) if len(state) else float(defaults['disease_cases'])
+    feat['location_case_std_prior'] = float(state['disease_cases'].std()) if len(state) > 1 else 0.0
+
+    for lag in lags:
+        key = f'disease_cases_lag_{lag}'
+        if len(state) >= lag:
+            feat[key] = float(state['disease_cases'].iloc[-lag])
+        else:
+            feat[key] = float(defaults['disease_cases'])
+
+    return pd.DataFrame([{c: feat.get(c, 0.0) for c in feature_cols}])
+
+
+# ---------------------------------------------------------------------------
+# PREDICTION
+# ---------------------------------------------------------------------------
 
 def predict(model_fn, historic_data_fn, future_climatedata_fn, predictions_fn):
-    def write_native_shap(model_obj, x_df, out_df):
-        if x_df.empty:
-            return
-        try:
-            explainer = shap.TreeExplainer(model_obj)
-            shap_values = explainer.shap_values(x_df)
-            expected_value = explainer.expected_value
-            if np.isscalar(expected_value):
-                expected = np.repeat(float(expected_value), len(x_df))
-            else:
-                expected = np.repeat(float(np.array(expected_value).reshape(-1)[0]), len(x_df))
-        except Exception:
-            if not hasattr(model_obj, "coef_") or not hasattr(model_obj, "intercept_"):
-                return
-            background = x_df.mean()
-            shap_values = (x_df - background).to_numpy() * np.array(model_obj.coef_)
-            expected = np.repeat(float(model_obj.intercept_ + np.dot(background.values, model_obj.coef_)), len(x_df))
-
-        shap_df = pd.DataFrame(shap_values, columns=x_df.columns)
-        shap_df.insert(0, 'time_period', out_df['time_period'].values)
-        shap_df.insert(0, 'location', out_df['location'].values)
-        shap_df.insert(2, 'expected_value', expected)
-        shap_df.to_csv("shap_values.csv", index=False)
-
     payload = joblib.load(model_fn)
-    future_df = pd.read_csv(future_climatedata_fn)
-    historic_df = pd.read_csv(historic_data_fn)
 
-    if not isinstance(payload, dict) or 'model' not in payload or 'features' not in payload:
+    if not isinstance(payload, dict) or 'model' not in payload:
+        # Minimal payload: bare estimator (no lags / feature engineering)
+        model = payload
+        future_df = pd.read_csv(future_climatedata_fn)
         if 'population' not in future_df.columns:
             future_df['population'] = 0.0
         X = future_df[['rainfall', 'mean_temperature', 'population']]
-        y_pred = payload.predict(X)
-        future_df['sample_0'] = y_pred
-        shap_out_df = future_df[['location', 'time_period']].copy()
-        shap_out_df['time_period'] = pd.to_datetime(shap_out_df['time_period']).dt.strftime('%Y%m_1')
-        write_native_shap(payload, X, shap_out_df)
+        future_df['sample_0'] = model.predict(X)
+        shap_out = future_df[['location', 'time_period']].copy()
+        shap_out['time_period'] = pd.to_datetime(shap_out['time_period']).dt.strftime('%Y-%m')
+        write_native_shap(model, X, shap_out)
         future_df.to_csv(predictions_fn, index=False)
-        print("Predictions: ", y_pred)
-        return y_pred
+        print("Predictions:", future_df['sample_0'].tolist())
+        return
 
     model = payload['model']
+    automl_results_path = payload.get('automl_results_path')
+    if automl_results_path:
+        model = AutoML(results_path=automl_results_path)
     feature_cols = payload['features']
     lags = payload.get('lags', [])
     target_transform = payload.get('target_transform')
 
-    historic_df['time_period'] = pd.to_datetime(historic_df['time_period'])
+    future_df = pd.read_csv(future_climatedata_fn)
+    historic_df = pd.read_csv(historic_data_fn)
+
     future_df['time_period'] = pd.to_datetime(future_df['time_period'])
+    historic_df['time_period'] = pd.to_datetime(historic_df['time_period'])
     historic_df = historic_df.sort_values(['location', 'time_period']).reset_index(drop=True)
     future_df = future_df.sort_values(['location', 'time_period']).reset_index(drop=True)
-    if 'population' not in historic_df.columns:
-        historic_df['population'] = np.nan
-    historic_df['population'] = pd.to_numeric(historic_df['population'], errors='coerce')
-    historic_df['rainfall'] = pd.to_numeric(historic_df['rainfall'], errors='coerce')
-    historic_df['mean_temperature'] = pd.to_numeric(historic_df['mean_temperature'], errors='coerce')
+
+    for col in ['population', 'rainfall', 'mean_temperature']:
+        if col not in historic_df.columns:
+            historic_df[col] = np.nan
+        historic_df[col] = pd.to_numeric(historic_df[col], errors='coerce')
     if 'disease_cases' not in historic_df.columns:
         historic_df['disease_cases'] = 0.0
     historic_df['disease_cases'] = pd.to_numeric(historic_df['disease_cases'], errors='coerce').fillna(0.0)
+
     if 'population' not in future_df.columns:
-        fallback_population = historic_df['population'].mean() if len(historic_df) else 0.0
-        future_df['population'] = fallback_population
+        future_df['population'] = historic_df['population'].mean() if len(historic_df) else 0.0
     future_df['population'] = pd.to_numeric(future_df['population'], errors='coerce')
 
     global_defaults = {
-        'rainfall': historic_df['rainfall'].mean() if len(historic_df) else 0.0,
-        'mean_temperature': historic_df['mean_temperature'].mean() if len(historic_df) else 0.0,
-        'population': historic_df['population'].mean() if len(historic_df) else 0.0,
-        'disease_cases': historic_df['disease_cases'].mean() if len(historic_df) else 0.0,
+        col: float(historic_df[col].mean()) if len(historic_df) else 0.0
+        for col in ['rainfall', 'mean_temperature', 'population', 'disease_cases']
     }
     by_loc_defaults = (
         historic_df.groupby('location')[['rainfall', 'mean_temperature', 'population', 'disease_cases']]
@@ -83,7 +206,8 @@ def predict(model_fn, historic_data_fn, future_climatedata_fn, predictions_fn):
     )
 
     state_by_loc = {
-        loc: grp[['time_period', 'rainfall', 'mean_temperature', 'population', 'disease_cases']].copy().reset_index(drop=True)
+        loc: grp[['time_period', 'rainfall', 'mean_temperature', 'population', 'disease_cases']]
+        .copy().reset_index(drop=True)
         for loc, grp in historic_df.groupby('location')
     }
 
@@ -97,55 +221,11 @@ def predict(model_fn, historic_data_fn, future_climatedata_fn, predictions_fn):
                 columns=['time_period', 'rainfall', 'mean_temperature', 'population', 'disease_cases']
             )
 
-        state = state_by_loc[loc]
-        feat = {
-            'rainfall': row['rainfall'],
-            'mean_temperature': row['mean_temperature'],
-            'month_sin': np.sin(2 * np.pi * row['time_period'].month / 12.0),
-            'month_cos': np.cos(2 * np.pi * row['time_period'].month / 12.0)
-        }
-
-        recent_cases = state['disease_cases'].tail(3) if len(state) else pd.Series(dtype=float)
-        if len(recent_cases):
-            feat['cases_roll_mean_3'] = float(recent_cases.mean())
-        else:
-            feat['cases_roll_mean_3'] = float(defaults['disease_cases'])
-        recent_cases_6 = state['disease_cases'].tail(6) if len(state) else pd.Series(dtype=float)
-        if len(recent_cases_6):
-            feat['cases_roll_mean_6'] = float(recent_cases_6.mean())
-        else:
-            feat['cases_roll_mean_6'] = float(defaults['disease_cases'])
-        if len(state) >= 2:
-            last_case = float(state.iloc[-1]['disease_cases'])
-            prev_case = float(state.iloc[-2]['disease_cases'])
-            feat['cases_diff_1'] = last_case - prev_case
-            feat['cases_growth'] = last_case / (prev_case + 1.0)
-        elif len(state) == 1:
-            last_case = float(state.iloc[-1]['disease_cases'])
-            feat['cases_diff_1'] = 0.0
-            feat['cases_growth'] = last_case / (defaults['disease_cases'] + 1.0)
-        else:
-            feat['cases_diff_1'] = 0.0
-            feat['cases_growth'] = 0.0
-        pop_value = row['population'] if pd.notna(row['population']) else defaults['population']
-        base_cases_for_rate = float(state.iloc[-1]['disease_cases']) if len(state) else float(defaults['disease_cases'])
-        feat['cases_per_100k'] = base_cases_for_rate / (float(pop_value) + 1.0) * 1e5
-
-        for lag in lags:
-            for col in ['rainfall', 'mean_temperature', 'population', 'disease_cases']:
-                key = f'{col}_lag_{lag}'
-                if len(state) >= lag:
-                    feat[key] = state.iloc[-lag][col]
-                else:
-                    feat[key] = defaults[col]
-
-        x = pd.DataFrame([{c: feat.get(c, 0.0) for c in feature_cols}])
+        x = _build_features_for_row(row, state_by_loc[loc], lags, defaults, feature_cols)
         x_rows.append(x.iloc[0].to_dict())
+
         y_raw = float(model.predict(x)[0])
-        if target_transform == 'log1p':
-            y_hat = float(np.clip(np.expm1(y_raw), 0, None))
-        else:
-            y_hat = y_raw
+        y_hat = float(np.clip(np.expm1(y_raw), 0, None)) if target_transform == 'log1p' else y_raw
         preds.append(y_hat)
         future_df.at[idx, 'sample_0'] = y_hat
 
@@ -153,26 +233,26 @@ def predict(model_fn, historic_data_fn, future_climatedata_fn, predictions_fn):
             'time_period': row['time_period'],
             'rainfall': row['rainfall'],
             'mean_temperature': row['mean_temperature'],
-            'population': row['population'],
-            'disease_cases': y_hat
+            'population': row.get('population', defaults['population']),
+            'disease_cases': y_hat,
         }])
-        state_by_loc[loc] = pd.concat([state, new_row], ignore_index=True)
+        state_by_loc[loc] = pd.concat([state_by_loc[loc], new_row], ignore_index=True)
 
     future_df['time_period'] = future_df['time_period'].dt.strftime('%Y-%m')
     x_pred_df = pd.DataFrame(x_rows)[feature_cols]
     shap_out_df = future_df[['location', 'time_period']].copy()
     write_native_shap(model, x_pred_df, shap_out_df)
+
     future_df.to_csv(predictions_fn, index=False)
-    print("Predictions: ", preds)
+    print("Predictions:", preds)
     return np.array(preds)
 
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Predict using the trained model.')
-
-    parser.add_argument('model_fn', type=str, help='Path to the trained model file.')
-    parser.add_argument('historic_data_fn', type=str, help='Path to the CSV file historic data (here ignored).')
-    parser.add_argument('future_climatedata_fn', type=str, help='Path to the CSV file containing future climate data.')
-    parser.add_argument('predictions_fn', type=str, help='Path to save the predictions CSV file.')
-
+    parser = argparse.ArgumentParser(description='Predict with a CHAP-compatible model.')
+    parser.add_argument('model_fn', type=str, help='Path to the trained model artifact.')
+    parser.add_argument('historic_data_fn', type=str, help='Path to historic data CSV.')
+    parser.add_argument('future_climatedata_fn', type=str, help='Path to future climate data CSV.')
+    parser.add_argument('predictions_fn', type=str, help='Path to write predictions CSV.')
     args = parser.parse_args()
     predict(args.model_fn, args.historic_data_fn, args.future_climatedata_fn, args.predictions_fn)

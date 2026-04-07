@@ -1,4 +1,7 @@
-time_period,rainfall,mean_temperature,location
-2023-07,20,20,loc1
-2023-08,30,20,loc1
-2023-09,30,30,loc1
+time_period,rainfall,mean_temperature,location,population
+2023-07,75,29,loc1,50000
+2023-08,60,28,loc1,50000
+2023-09,40,27,loc1,50000
+2023-10,18,25,loc1,50000
+2023-11,8,23,loc1,50000
+2023-12,3,21,loc1,50000
