@@ -7,6 +7,7 @@ Generates CHAP-compatible forecasts and writes native SHAP explanations to
 """
 
 import argparse
+import os
 
 import joblib
 import numpy as np
@@ -19,7 +20,22 @@ from supervised.automl import AutoML
 # NATIVE SHAP OUTPUT  ← keep as-is; works for any shap-supported model
 # ---------------------------------------------------------------------------
 
-def write_native_shap(model, x_df, out_df, out_path="shap_values.csv"):
+def _extract_shap_arrays(shap_result):
+    base = None
+    values = shap_result
+    if hasattr(shap_result, "values"):
+        values = shap_result.values
+    if hasattr(shap_result, "base_values"):
+        base = shap_result.base_values
+    values = np.asarray(values)
+    if values.ndim == 3:
+        values = values[:, :, 0]
+    if base is not None:
+        base = np.asarray(base)
+    return values, base
+
+
+def write_native_shap(model, x_df, out_df, out_path):
     """
     Compute per-row SHAP values and write shap_values.csv.
 
@@ -36,48 +52,65 @@ def write_native_shap(model, x_df, out_df, out_path="shap_values.csv"):
 
     feature_cols = list(x_df.columns)
 
-    # 1. Tree models
-    try:
-        explainer = shap.TreeExplainer(model)
-        sv = explainer.shap_values(x_df)
-        ev = explainer.expected_value
-        expected = np.full(len(x_df), float(np.array(ev).reshape(-1)[0]))
-    except Exception:
-        sv = None
+    def _candidate_models(m):
+        candidates = [m]
+        for attr in ["model", "_model", "best_model", "_best_model", "_final_model"]:
+            val = getattr(m, attr, None)
+            if val is not None:
+                candidates.append(val)
+        return candidates
 
-    # 2. Linear models
-    if sv is None:
+    sv = None
+    expected = None
+    for candidate in _candidate_models(model):
         try:
-            explainer = shap.LinearExplainer(model, x_df)
-            sv = explainer.shap_values(x_df)
-            ev = explainer.expected_value
-            expected = np.full(len(x_df), float(np.array(ev).reshape(-1)[0]))
+            explainer = shap.TreeExplainer(candidate)
+            shap_result = explainer(x_df)
+            sv, base = _extract_shap_arrays(shap_result)
+            if base is None:
+                ev = np.asarray(explainer.expected_value).reshape(-1)
+                expected = np.full(len(x_df), float(ev[0]))
+            else:
+                expected = np.asarray(base).reshape(-1)
+            break
         except Exception:
-            sv = None
+            continue
 
-    # 3. Generic fallback (KernelExplainer — slow for large feature sets)
+    if sv is None:
+        for candidate in _candidate_models(model):
+            try:
+                explainer = shap.LinearExplainer(candidate, x_df)
+                shap_result = explainer(x_df)
+                sv, base = _extract_shap_arrays(shap_result)
+                if base is None:
+                    ev = np.asarray(explainer.expected_value).reshape(-1)
+                    expected = np.full(len(x_df), float(ev[0]))
+                else:
+                    expected = np.asarray(base).reshape(-1)
+                break
+            except Exception:
+                continue
+
     if sv is None:
         try:
             background = shap.sample(x_df, min(50, len(x_df)), random_state=42)
             explainer = shap.KernelExplainer(model.predict, background)
-            sv = explainer.shap_values(x_df)
-            ev = explainer.expected_value
-            expected = np.full(len(x_df), float(np.array(ev).reshape(-1)[0]))
+            shap_result = explainer.shap_values(x_df)
+            sv, _ = _extract_shap_arrays(shap_result)
+            ev = np.asarray(explainer.expected_value).reshape(-1)
+            expected = np.full(len(x_df), float(ev[0]))
         except Exception:
             print("Warning: could not compute SHAP values — shap_values.csv not written.")
             return
 
     if isinstance(sv, list):
         sv = sv[0]
-    if hasattr(sv, "values"):
-        sv = sv.values
     sv = np.asarray(sv)
-    if sv.ndim == 3:
-        sv = sv[:, :, 0]
+    if sv.shape == (len(feature_cols), len(x_df)):
+        sv = sv.T
     if sv.shape != (len(x_df), len(feature_cols)):
-        raise ValueError(
-            f"Unexpected SHAP shape {sv.shape}, expected {(len(x_df), len(feature_cols))}"
-        )
+        print(f"Warning: SHAP shape {sv.shape} does not match {(len(x_df), len(feature_cols))}.")
+        return
 
     expected = np.asarray(expected)
     if expected.ndim == 0:
@@ -175,14 +208,18 @@ def predict(model_fn, historic_data_fn, future_climatedata_fn, predictions_fn):
         future_df['sample_0'] = model.predict(X)
         shap_out = future_df[['location', 'time_period']].copy()
         shap_out['time_period'] = pd.to_datetime(shap_out['time_period']).dt.strftime('%Y-%m')
-        write_native_shap(model, X, shap_out)
+        shap_out_path = os.path.join(
+            os.path.dirname(os.path.abspath(predictions_fn)),
+            "shap_values.csv",
+        )
+        write_native_shap(model, X, shap_out, shap_out_path)
         future_df.to_csv(predictions_fn, index=False)
         print("Predictions:", future_df['sample_0'].tolist())
         return
 
     model = payload['model']
     automl_results_path = payload.get('automl_results_path')
-    if automl_results_path:
+    if automl_results_path and not hasattr(model, "predict"):
         model = AutoML(results_path=automl_results_path)
     feature_cols = payload['features']
     lags = payload.get('lags', [])
@@ -257,7 +294,11 @@ def predict(model_fn, historic_data_fn, future_climatedata_fn, predictions_fn):
         if col not in future_df.columns:
             future_df[col] = x_pred_df[col].values
     shap_out_df = future_df[['location', 'time_period']].copy()
-    write_native_shap(model, x_pred_df, shap_out_df)
+    shap_out_path = os.path.join(
+        os.path.dirname(os.path.abspath(predictions_fn)),
+        "shap_values.csv",
+    )
+    write_native_shap(model, x_pred_df, shap_out_df, shap_out_path)
 
     future_df.to_csv(predictions_fn, index=False)
     print("Predictions:", preds)
