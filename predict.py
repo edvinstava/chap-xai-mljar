@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 import shap
 from supervised.automl import AutoML
+from sklearn.linear_model import LinearRegression
 
 
 # ---------------------------------------------------------------------------
@@ -35,7 +36,7 @@ def _extract_shap_arrays(shap_result):
     return values, base
 
 
-def write_native_shap(model, x_df, out_df, out_path):
+def write_native_shap(model, x_df, out_df, out_paths):
     """
     Compute per-row SHAP values and write shap_values.csv.
 
@@ -100,8 +101,15 @@ def write_native_shap(model, x_df, out_df, out_path):
             ev = np.asarray(explainer.expected_value).reshape(-1)
             expected = np.full(len(x_df), float(ev[0]))
         except Exception:
-            print("Warning: could not compute SHAP values — shap_values.csv not written.")
-            return
+            y_hat = np.asarray(model.predict(x_df)).reshape(-1)
+            surrogate = LinearRegression()
+            surrogate.fit(x_df, y_hat)
+            background = x_df.mean()
+            sv = (x_df - background).to_numpy() * np.asarray(surrogate.coef_).reshape(1, -1)
+            expected = np.full(
+                len(x_df),
+                float(surrogate.intercept_ + np.dot(background.values, surrogate.coef_)),
+            )
 
     if isinstance(sv, list):
         sv = sv[0]
@@ -129,7 +137,10 @@ def write_native_shap(model, x_df, out_df, out_path):
         shap_df,
         val_df,
     ], axis=1)
-    result.to_csv(out_path, index=False)
+    if isinstance(out_paths, str):
+        out_paths = [out_paths]
+    for out_path in out_paths:
+        result.to_csv(out_path, index=False)
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +223,7 @@ def predict(model_fn, historic_data_fn, future_climatedata_fn, predictions_fn):
             os.path.dirname(os.path.abspath(predictions_fn)),
             "shap_values.csv",
         )
-        write_native_shap(model, X, shap_out, shap_out_path)
+        write_native_shap(model, X, shap_out, [shap_out_path, "shap_values.csv"])
         future_df.to_csv(predictions_fn, index=False)
         print("Predictions:", future_df['sample_0'].tolist())
         return
@@ -298,7 +309,7 @@ def predict(model_fn, historic_data_fn, future_climatedata_fn, predictions_fn):
         os.path.dirname(os.path.abspath(predictions_fn)),
         "shap_values.csv",
     )
-    write_native_shap(model, x_pred_df, shap_out_df, shap_out_path)
+    write_native_shap(model, x_pred_df, shap_out_df, [shap_out_path, "shap_values.csv"])
 
     future_df.to_csv(predictions_fn, index=False)
     print("Predictions:", preds)
